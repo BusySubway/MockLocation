@@ -4,7 +4,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -12,8 +11,400 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
-      - run: gradle assembleDebug
+      - name: Generate project
+        run: |
+          mkdir -p proj/app/src/main/java/com/example/mockloc
+          cd proj
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MockLocation"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.mockloc"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.mockloc"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_MOCK_LOCATION"
+                  tools:ignore="MockLocation,ProtectedPermissions" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="模拟定位"
+                  android:icon="@android:drawable/ic_menu_mylocation"
+                  android:allowBackup="false">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MockService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/example/mockloc/MainActivity.kt <<'EOF_FILE'
+          package com.example.mockloc
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.AppOpsManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var latEt: EditText
+              private lateinit var lngEt: EditText
+              private lateinit var statusTv: TextView
+
+              private val presets = linkedMapOf(
+                  "北京" to (39.9042 to 116.4074),
+                  "上海" to (31.2304 to 121.4737),
+                  "广州" to (23.1291 to 113.2644),
+                  "深圳" to (22.5431 to 114.0579)
+              )
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences(MockService.PREFS, MODE_PRIVATE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(48), dp(20), dp(24))
+                  }
+                  root.addView(TextView(this).apply { text = "模拟定位"; textSize = 24f })
+                  statusTv = TextView(this).apply { textSize = 15f; setPadding(0, dp(8), 0, dp(16)) }
+                  root.addView(statusTv)
+
+                  latEt = numberField("纬度 latitude", prefs.getString(MockService.KEY_LAT, "39.9042")!!)
+                  lngEt = numberField("经度 longitude", prefs.getString(MockService.KEY_LNG, "116.4074")!!)
+                  root.addView(latEt)
+                  root.addView(lngEt)
+
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  for ((name, pos) in presets) {
+                      row.addView(Button(this).apply {
+                          text = name
+                          setOnClickListener {
+                              latEt.setText(pos.first.toString())
+                              lngEt.setText(pos.second.toString())
+                          }
+                      }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  root.addView(row)
+
+                  root.addView(button("开始模拟") { start() })
+                  root.addView(button("停止模拟") {
+                      stopService(Intent(this, MockService::class.java))
+                      statusTv.postDelayed({ updateStatus() }, 300)
+                  })
+                  root.addView(button("打开开发者选项") { openDevSettings() })
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateStatus()
+              }
+
+              private fun start() {
+                  val lat = latEt.text.toString().toDoubleOrNull()
+                  val lng = lngEt.text.toString().toDoubleOrNull()
+                  if (lat == null || lng == null || lat !in -90.0..90.0 || lng !in -180.0..180.0) {
+                      toast("坐标格式不对")
+                      return
+                  }
+                  getSharedPreferences(MockService.PREFS, MODE_PRIVATE).edit()
+                      .putString(MockService.KEY_LAT, lat.toString())
+                      .putString(MockService.KEY_LNG, lng.toString())
+                      .apply()
+
+                  if (!isMockApp()) {
+                      AlertDialog.Builder(this)
+                          .setTitle("还差一步")
+                          .setMessage("请在 开发者选项 → 选择模拟位置信息应用 中选择“模拟定位”，然后回来再点开始。")
+                          .setPositiveButton("去设置") { _, _ -> openDevSettings() }
+                          .setNegativeButton("取消", null)
+                          .show()
+                      return
+                  }
+
+                  val perms = mutableListOf(
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) perms += Manifest.permission.POST_NOTIFICATIONS
+                  val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isNotEmpty()) {
+                      requestPermissions(missing.toTypedArray(), 1)
+                  } else {
+                      launchService()
+                  }
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, results)
+                  if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                      launchService()
+                  } else {
+                      toast("需要定位权限才能运行前台定位服务")
+                  }
+              }
+
+              private fun launchService() {
+                  // 已在运行时先停掉，以便应用新坐标
+                  stopService(Intent(this, MockService::class.java))
+                  startForegroundService(Intent(this, MockService::class.java))
+                  statusTv.postDelayed({ updateStatus() }, 800)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun isMockApp(): Boolean {
+                  val ops = getSystemService(APP_OPS_SERVICE) as AppOpsManager
+                  val mode = if (Build.VERSION.SDK_INT >= 29)
+                      ops.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_MOCK_LOCATION, Process.myUid(), packageName)
+                  else
+                      ops.checkOpNoThrow(AppOpsManager.OPSTR_MOCK_LOCATION, Process.myUid(), packageName)
+                  return mode == AppOpsManager.MODE_ALLOWED
+              }
+
+              private fun openDevSettings() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                  } catch (_: Exception) {
+                      toast("请先开启开发者模式：设置 → 我的设备 → 全部参数 → 连点 OS 版本")
+                  }
+              }
+
+              private fun updateStatus() {
+                  statusTv.text = if (MockService.running) "状态：运行中 ✅" else "状态：未运行"
+              }
+
+              private fun numberField(hint: String, value: String) = EditText(this).apply {
+                  this.hint = hint
+                  setText(value)
+                  inputType = InputType.TYPE_CLASS_NUMBER or
+                      InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+              }
+
+              private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
+                  text = label
+                  setOnClickListener { onClick() }
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+          }
+          EOF_FILE
+          cat > app/src/main/java/com/example/mockloc/MockService.kt <<'EOF_FILE'
+          package com.example.mockloc
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.location.Location
+          import android.location.LocationManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.widget.Toast
+          import kotlin.random.Random
+
+          /** 前台服务：每秒向 GPS / 网络 / 融合定位推送一次模拟坐标 */
+          class MockService : Service() {
+
+              companion object {
+                  const val PREFS = "mock"
+                  const val KEY_LAT = "lat"
+                  const val KEY_LNG = "lng"
+                  private const val CHANNEL = "mock"
+                  @Volatile var running = false
+              }
+
+              private lateinit var lm: LocationManager
+              private val handler = Handler(Looper.getMainLooper())
+              private val providers = mutableListOf<String>()
+              private var lat = 39.9042
+              private var lng = 116.4074
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      push()
+                      handler.postDelayed(this, 1000)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+                  lat = prefs.getString(KEY_LAT, null)?.toDoubleOrNull() ?: lat
+                  lng = prefs.getString(KEY_LNG, null)?.toDoubleOrNull() ?: lng
+
+                  startInForeground()
+                  lm = getSystemService(LOCATION_SERVICE) as LocationManager
+
+                  if (providers.isEmpty() && !setupProviders()) {
+                      Toast.makeText(this, "请先在开发者选项里把本应用设为模拟位置应用", Toast.LENGTH_LONG).show()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  handler.removeCallbacks(tick)
+                  handler.post(tick)
+                  running = true
+                  return START_STICKY
+              }
+
+              @Suppress("DEPRECATION")
+              private fun setupProviders(): Boolean {
+                  val names = mutableListOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                  if (Build.VERSION.SDK_INT >= 31) names += LocationManager.FUSED_PROVIDER
+                  for (p in names) {
+                      try {
+                          try { lm.removeTestProvider(p) } catch (_: Exception) {}
+                          // 参数: requiresNetwork, requiresSatellite, requiresCell, hasMonetaryCost,
+                          //       supportsAltitude, supportsSpeed, supportsBearing, power(LOW=1), accuracy(FINE=1)
+                          lm.addTestProvider(p, false, false, false, false, true, true, true, 1, 1)
+                          lm.setTestProviderEnabled(p, true)
+                          providers += p
+                      } catch (e: SecurityException) {
+                          return false          // 未被选为模拟位置应用
+                      } catch (_: Exception) {
+                          // 个别机型不支持某个 provider，跳过即可
+                      }
+                  }
+                  return providers.isNotEmpty()
+              }
+
+              private fun push() {
+                  for (p in providers) {
+                      val loc = Location(p).apply {
+                          // 极小的随机抖动，让位置看起来更像真实信号
+                          latitude = lat + (Random.nextDouble() - 0.5) * 0.00004
+                          longitude = lng + (Random.nextDouble() - 0.5) * 0.00004
+                          altitude = 50.0
+                          accuracy = if (p == LocationManager.GPS_PROVIDER) 5f else 20f
+                          speed = 0f
+                          bearing = 0f
+                          time = System.currentTimeMillis()
+                          elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
+                      }
+                      try { lm.setTestProviderLocation(p, loc) } catch (_: Exception) {}
+                  }
+              }
+
+              private fun startInForeground() {
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "模拟定位", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n: Notification = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("模拟定位运行中")
+                      .setContentText(String.format("%.4f, %.4f", lat, lng))
+                      .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(tick)
+                  for (p in providers) {
+                      try { lm.setTestProviderEnabled(p, false) } catch (_: Exception) {}
+                      try { lm.removeTestProvider(p) } catch (_: Exception) {}
+                  }
+                  providers.clear()
+                  running = false
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          find . -type f
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --warning-mode all
       - uses: actions/upload-artifact@v4
         with:
           name: MockLocation-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: proj/app/build/outputs/apk/debug/*.apk
